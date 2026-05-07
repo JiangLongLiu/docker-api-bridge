@@ -90,6 +90,18 @@ python ~/.qoder/skills/docker-api-bridge/scripts/deploy.py --csv hosts.csv --bin
 python ~/.qoder/skills/docker-api-bridge/scripts/deploy.py --csv hosts.csv --rollback
 ```
 
+**5. Offline host — local build (dockerd is NOT restarted)**
+
+Use this when the target host has no internet egress, or `dockerd` was configured with an `http-proxy` that's now offline and you can't restart `dockerd` (e.g. a Synology running 100+ containers). Requires that the target host already has a small base image locally (default `alpine:3.18.2`) and can reach the build-time proxy.
+
+```bash
+python ~/.qoder/skills/docker-api-bridge/scripts/deploy.py \
+    --csv hosts.csv \
+    --build-proxy http://10.0.0.1:7890
+```
+
+This switches the path from `docker pull` to `docker build` on the host: a 5-line `Dockerfile` (`FROM alpine:3.18.2 + apk add socat + ENTRYPOINT ["socat"]`) is written to `/tmp/dab-socat-build/`, built with `--build-arg http_proxy=...`, then run as `local/socat:latest`. **`dockerd` is not restarted, `daemon.json` is not modified.**
+
 ### Sample Output
 
 ```
@@ -134,14 +146,16 @@ HOST               STATUS         ARCH     OS
 | `--container` | `dockhand-docker-proxy` | Bridge container name |
 | `--port` | `2375` | TCP port to publish on the host |
 | `--bind` | `0.0.0.0` | Host NIC to bind on; set to an internal IP to lock down |
-| `--image` | `alpine/socat:latest` | socat image to use |
+| `--image` | `alpine/socat:latest` | socat image to use; auto-switched to `local/socat:latest` when `--build-proxy` is set |
+| `--build-proxy` | empty | Triggers **local build mode**: skip `docker pull`, build a socat image on the host from `--build-base`, with `apk add socat` going through this HTTP proxy. `dockerd` is NOT restarted, `daemon.json` is NOT touched. |
+| `--build-base` | `alpine:3.18.2` | Base image for local build mode; must already exist on the target host |
 | `--dry-run` | off | Detect + plan only; no `docker run` |
 | `--rollback` | off | Remove bridge container instead of deploying |
 
 ### Exit Codes
 
 - `0` — all hosts OK / DRY_RUN_OK / ROLLBACK_OK
-- `1` — at least one host failed (SSH_FAIL / ABORTED / APPLY_FAIL / VERIFY_FAIL)
+- `1` — at least one host failed (SSH_FAIL / ABORTED / BUILD_FAIL / APPLY_FAIL / VERIFY_FAIL)
 - `2` — CSV missing or empty
 
 ## How It Works
@@ -149,21 +163,45 @@ HOST               STATUS         ARCH     OS
 For each host in the CSV, `deploy.py` executes 4 phases via paramiko:
 
 1. **upload** — copies `bridge.sh` to `/tmp/dab_bridge.sh` (SFTP, with base64 + `exec_command` fallback)
-2. **detect** — runs `bash bridge.sh detect` which prints a single-line JSON of arch / kernel / OS / docker version / socket / port / existing container / daemon proxy
+2. **detect** — runs `bash bridge.sh detect` which prints a single-line JSON of arch / kernel / OS / docker version / socket / port / existing container / daemon proxy / base image presence
 3. **plan** — Python decides locally:
    - existing container healthy → `SKIP`
    - existing container stale → `REMOVE` + `RUN`
    - port held by non-`docker-proxy` → `ABORT`
-   - image missing → `PULL`
-4. **apply + verify** — runs `docker run -d --restart=always -p <BIND>:<PORT>:2375 -v /var/run/docker.sock:/var/run/docker.sock alpine/socat -d TCP-LISTEN:2375,fork,reuseaddr UNIX-CONNECT:/var/run/docker.sock`, then validates `ss`, `_ping`, `/version`.
+   - image missing + no `--build-proxy` → `PULL`
+   - image missing + `--build-proxy` set → `BUILD` (aborts if base image is missing)
+4. **build** (local-build mode only) — writes `/tmp/dab-socat-build/Dockerfile`, runs `docker build --build-arg http_proxy=... --build-arg https_proxy=... -t local/socat:latest .`, verifies `ENTRYPOINT` is the JSON array `[socat]`
+5. **apply + verify** — runs `docker run -d --restart=always -p <BIND>:<PORT>:2375 -v /var/run/docker.sock:/var/run/docker.sock <IMAGE> -d TCP-LISTEN:2375,fork,reuseaddr UNIX-CONNECT:/var/run/docker.sock`, then validates `ss`, `_ping`, `/version`.
+
+### Local Build Mode (Offline Hosts)
+
+When `--build-proxy` is given, the bridge image is built on the target host instead of pulled. This is the only safe path on hosts that:
+
+- Have no internet egress
+- Have a `dockerd.json` `http-proxy` that's now offline, **and** dockerd cannot be restarted (e.g. Synology running 100+ containers)
+- Can't reach any registry mirror
+
+**Requirements:**
+
+1. Target host has the `--build-base` image locally (default `alpine:3.18.2`; any alpine tag that supports `apk add socat` works)
+2. Target host can reach the proxy URL passed via `--build-proxy` (only during build, ~1 MB traffic for `apk add socat`)
+
+**Safety guarantees** (verified on Synology DSM 6.2 with 113 containers running, 34 of them active):
+
+- `dockerd` is **not** restarted
+- `daemon.json` is **not** modified
+- No other container on the host is touched
+
+The built image lives as `local/socat:latest`; rollback with `--rollback` removes the bridge container, and you can `docker rmi local/socat:latest` manually if you want it gone too.
 
 ## Compatibility Matrix (verified)
 
-| OS | Arch | Docker | Notes |
-|---|---|---|---|
-| Synology DSM 6.2 | x86_64 | 20.10.3 | SFTP off → base64 fallback used; PATH expanded to `/var/packages/Docker/target/usr/bin` |
-| fnOS (Debian 12) | aarch64 | 28.2.2 | Standard path; survives fnOS updates |
-| fnOS (Debian 12) | x86_64 | 28.2.2+ | Standard path |
+| OS | Arch | Docker | Image source | Notes |
+|---|---|---|---|---|
+| Synology DSM 6.2 | x86_64 | 20.10.3 | `docker pull` | SFTP off → base64 fallback used; PATH expanded to `/var/packages/Docker/target/usr/bin` |
+| Synology DSM 6.2 (offline) | x86_64 | 20.10.3 | `--build-proxy` (local build) | Validated against a live host with 113 containers; dockerd NOT restarted |
+| fnOS (Debian 12) | aarch64 | 28.2.2 | `docker pull` | Standard path; survives fnOS updates |
+| fnOS (Debian 12) | x86_64 | 28.2.2+ | `docker pull` | Standard path |
 
 The `bridge.sh` PATH already includes Synology Container Manager, OpenWrt, and Entware (`/opt/bin`) prefixes, so most NAS / embedded distros work out of the box.
 
@@ -214,6 +252,11 @@ The remote SSH server has SFTP disabled (typical Synology DSM 6.2). The skill au
 
 **Issue: `ABORT: port 2375 occupied by non-docker-proxy`**
 Something else (likely `dockerd -H tcp://...` from a previous manual fix) is holding `:2375`. Either pick a different `--port`, or stop the old listener first.
+
+**Issue: `docker pull` fails with `proxyconnect tcp: ... no route to host`**
+Dockerd is holding a stale `http-proxy` from `daemon.json`. Two options:
+1. Restart dockerd after fixing `daemon.json` (risky if many containers are running)
+2. **Use `--build-proxy <reachable-proxy-url>`** — builds the bridge image locally from a base image already on the host. dockerd is not restarted, `daemon.json` is not touched. See [Local Build Mode](#local-build-mode-offline-hosts).
 
 ## License
 

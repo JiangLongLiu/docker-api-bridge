@@ -90,6 +90,18 @@ python ~/.qoder/skills/docker-api-bridge/scripts/deploy.py --csv hosts.csv --bin
 python ~/.qoder/skills/docker-api-bridge/scripts/deploy.py --csv hosts.csv --rollback
 ```
 
+**5. 无外网主机 —— 本地 build（dockerd 完全不动）**
+
+适用于目标主机无外网出口，或者 `dockerd` 配过 `http-proxy` 但代理已下线且不能重启 dockerd（例如群晖在跑 100+ 容器）。前提是目标主机本地已有一个小镜像作为 base（默认 `alpine:3.18.2`），并且能访问你传进去的代理。
+
+```bash
+python ~/.qoder/skills/docker-api-bridge/scripts/deploy.py \
+    --csv hosts.csv \
+    --build-proxy http://10.0.0.1:7890
+```
+
+这会把 `docker pull` 路径换成远端 `docker build`：在 `/tmp/dab-socat-build/` 生成一个 5 行的 `Dockerfile`（`FROM alpine:3.18.2 + apk add socat + ENTRYPOINT ["socat"]`），用 `--build-arg http_proxy=...` 构建出 `local/socat:latest`。**dockerd 不重启，daemon.json 不动**。
+
 ### 输出示例
 
 ```
@@ -134,14 +146,16 @@ HOST               STATUS         ARCH     OS
 | `--container` | `dockhand-docker-proxy` | 桥接容器名 |
 | `--port` | `2375` | 对外监听端口 |
 | `--bind` | `0.0.0.0` | 监听网卡，可改成内网 IP 收紧 |
-| `--image` | `alpine/socat:latest` | 桥接镜像 |
+| `--image` | `alpine/socat:latest` | 桥接镜像；当 `--build-proxy` 设置时自动切换为 `local/socat:latest` |
+| `--build-proxy` | 空 | 触发**本地 build 模式**：跳过 `docker pull`，远端基于 `--build-base` 本机构建 socat 镜像，build 阶段通过该 HTTP 代理 `apk add socat`。dockerd 不重启，daemon.json 不动 |
+| `--build-base` | `alpine:3.18.2` | 本地 build 模式的基础镜像，必须已存在于目标主机本地 |
 | `--dry-run` | off | 只 detect + plan，不 apply |
 | `--rollback` | off | 移除桥接容器，恢复原状 |
 
 ### 退出码
 
 - `0` 全部主机 OK / DRY_RUN_OK / ROLLBACK_OK
-- `1` 至少一台失败（SSH_FAIL / ABORTED / APPLY_FAIL / VERIFY_FAIL）
+- `1` 至少一台失败（SSH_FAIL / ABORTED / BUILD_FAIL / APPLY_FAIL / VERIFY_FAIL）
 - `2` CSV 缺失或为空
 
 ## 工作原理
@@ -149,21 +163,45 @@ HOST               STATUS         ARCH     OS
 每台主机 4 个阶段（paramiko 串行执行）：
 
 1. **upload** —— 把 `bridge.sh` 上传到 `/tmp/dab_bridge.sh`（SFTP 优先，失败则用 base64 + `exec_command` 兜底）
-2. **detect** —— 远端执行 `bash bridge.sh detect`，输出单行 JSON：arch / kernel / OS / Docker 版本 / socket / 端口 / 已有容器 / daemon 代理
+2. **detect** —— 远端执行 `bash bridge.sh detect`，输出单行 JSON：arch / kernel / OS / Docker 版本 / socket / 端口 / 已有容器 / daemon 代理 / 基础镜像是否存在
 3. **plan** —— Python 本地决策：
    - 已有同名容器且健康 → `SKIP`
    - 已有容器但异常 → `REMOVE` + `RUN`
    - 端口被非 docker-proxy 占用 → `ABORT`
-   - 镜像缺失 → `PULL`
-4. **apply + verify** —— 执行 `docker run -d --restart=always -p <BIND>:<PORT>:2375 -v /var/run/docker.sock:/var/run/docker.sock alpine/socat -d TCP-LISTEN:2375,fork,reuseaddr UNIX-CONNECT:/var/run/docker.sock`，再用 `ss`、`_ping`、`/version` 三连验证
+   - 镜像缺失 + 未提供 `--build-proxy` → `PULL`
+   - 镜像缺失 + 提供了 `--build-proxy` → `BUILD`（基础镜像缺失则 `ABORT`）
+4. **build**（仅本地 build 模式）—— 远端写入 `/tmp/dab-socat-build/Dockerfile`，`docker build --build-arg http_proxy=... --build-arg https_proxy=... -t local/socat:latest .`，构建后校验 `ENTRYPOINT` 是 JSON 数组 `[socat]`
+5. **apply + verify** —— 执行 `docker run -d --restart=always -p <BIND>:<PORT>:2375 -v /var/run/docker.sock:/var/run/docker.sock <IMAGE> -d TCP-LISTEN:2375,fork,reuseaddr UNIX-CONNECT:/var/run/docker.sock`，再用 `ss`、`_ping`、`/version` 三连验证
+
+### 本地 build 模式（无外网主机专用）
+
+提供 `--build-proxy` 后，桥接镜像会在目标主机上本地构建，而不是 `docker pull`。这是以下场景唯一安全的路径：
+
+- 主机无外网出口
+- `dockerd.json` 配了已下线的 `http-proxy`，且不能重启 dockerd（如群晖跑着 100+ 容器）
+- registry mirror 也不通
+
+**前置条件**：
+
+1. 目标主机本地已有 `--build-base` 镜像（默认 `alpine:3.18.2`；任何能 `apk add socat` 的 alpine 标签都行）
+2. 目标主机能访问 `--build-proxy` 的 URL（仅 build 期间需要，大约 1 MB 流量走 `apk add socat`）
+
+**安全保证**（在群晖 DSM 6.2 + 113 容器（34 运行中）环境实战验证过）：
+
+- **不重启** dockerd
+- **不修改** `daemon.json`
+- 主机上任何其他容器都不被动
+
+构建出来的镜像叫 `local/socat:latest`；`--rollback` 依然能移除桥接容器，镜像需要手动 `docker rmi local/socat:latest` 清理。
 
 ## 兼容性矩阵（已验证）
 
-| 系统 | 架构 | Docker | 备注 |
-|---|---|---|---|
-| 群晖 DSM 6.2 | x86_64 | 20.10.3 | SFTP 默认禁用 → 自动 base64 兜底；PATH 已扩展到 `/var/packages/Docker/target/usr/bin` |
-| fnOS (Debian 12) | aarch64 | 28.2.2 | 标准路径；fnOS 升级免疫 |
-| fnOS (Debian 12) | x86_64 | 28.2.2+ | 标准路径 |
+| 系统 | 架构 | Docker | 镜像来源 | 备注 |
+|---|---|---|---|---|
+| 群晖 DSM 6.2 | x86_64 | 20.10.3 | `docker pull` | SFTP 默认禁用 → 自动 base64 兜底；PATH 已扩展到 `/var/packages/Docker/target/usr/bin` |
+| 群晖 DSM 6.2（无外网）| x86_64 | 20.10.3 | `--build-proxy`（本地 build）| 在 113 容器运行的实体机实战验证；dockerd 不重启 |
+| fnOS (Debian 12) | aarch64 | 28.2.2 | `docker pull` | 标准路径；fnOS 升级免疫 |
+| fnOS (Debian 12) | x86_64 | 28.2.2+ | `docker pull` | 标准路径 |
 
 `bridge.sh` 顶部 PATH 已预置：群晖 Docker / 群晖 Container Manager / OpenWrt / Entware (`/opt/bin`)，绝大多数 NAS / 嵌入式发行版开箱即用。
 
@@ -214,6 +252,11 @@ docker-api-bridge/
 
 **问题：`ABORT: port 2375 occupied by non-docker-proxy`**
 端口 2375 被其他进程持有（多半是早先手动加 `dockerd -H tcp://...` 的残留）。换 `--port`，或先停掉旧监听。
+
+**问题：`docker pull` 报 `proxyconnect tcp: ... no route to host`**
+Dockerd 还持着 `daemon.json` 里的旧 `http-proxy`。两选一：
+1. 修正 `daemon.json` 后重启 dockerd（主机跑很多容器时风险很高）
+2. **用 `--build-proxy <可达代理URL>`** —— 基于主机本地已有的基础镜像就地 build 桥接镜像。dockerd 不重启，`daemon.json` 不动。详见上面《本地 build 模式》。
 
 ## 许可证
 

@@ -17,6 +17,7 @@ import argparse
 import base64
 import csv
 import json
+import shlex
 import sys
 from pathlib import Path
 
@@ -31,6 +32,9 @@ import paramiko  # noqa: E402
 SCRIPT_DIR = Path(__file__).resolve().parent
 BRIDGE_SH = SCRIPT_DIR / "bridge.sh"
 REMOTE_PATH = "/tmp/dab_bridge.sh"
+
+DEFAULT_IMAGE = "alpine/socat:latest"
+LOCAL_BUILD_IMAGE = "local/socat:latest"
 
 CSV_KEYS = {
     "ip":       ["IP地址", "ip", "IP", "host", "Host", "HOST"],
@@ -116,10 +120,16 @@ def upload_bridge(client):
 
 
 def remote_args(args) -> str:
-    return (
-        f"--container {args.container} --port {args.port} "
-        f"--bind {args.bind} --image {args.image}"
-    )
+    parts = [
+        f"--container {shlex.quote(args.container)}",
+        f"--port {args.port}",
+        f"--bind {shlex.quote(args.bind)}",
+        f"--image {shlex.quote(args.image)}",
+        f"--build-base {shlex.quote(args.build_base)}",
+    ]
+    if args.build_proxy:
+        parts.append(f"--build-proxy {shlex.quote(args.build_proxy)}")
+    return " ".join(parts)
 
 
 def detect(client, args):
@@ -149,7 +159,19 @@ def make_plan(info: dict, args) -> list[str]:
         return [f"ABORT: port {args.port} occupied by non-docker-proxy: {info.get('port_listener')}"]
 
     if not info.get("image_present"):
-        plan.append(f"PULL: {args.image}")
+        if args.build_proxy:
+            # Local build path: skip docker pull entirely.
+            if not info.get("base_image_present"):
+                return [
+                    f"ABORT: --build-proxy set but base image '{info.get('base_image')}' "
+                    f"missing on host; pull it first or pass --build-base <existing-image>"
+                ]
+            plan.append(
+                f"BUILD: {args.image} <- {info.get('base_image')} "
+                f"(apk add socat via proxy {args.build_proxy})"
+            )
+        else:
+            plan.append(f"PULL: {args.image}")
     plan.append(f"RUN: socat -p {args.bind}:{args.port}:2375")
     plan.append("VERIFY")
     return plan
@@ -198,6 +220,19 @@ def deploy_one(host: dict, args) -> dict:
                     "arch": info.get("arch"), "os": info.get("os_pretty")}
 
         if not any(p.startswith("SKIP") for p in plan):
+            if any(p.startswith("BUILD:") for p in plan):
+                print("--- BUILD ---")
+                rc, out, err = run(
+                    client,
+                    f"bash {REMOTE_PATH} build {remote_args(args)}",
+                    timeout=300,
+                )
+                sys.stdout.write(out[-3000:])
+                if rc != 0:
+                    if err.strip():
+                        print("STDERR:", err.strip()[-800:])
+                    return {"host": host["ip"], "status": "BUILD_FAIL", "rc": rc,
+                            "arch": info.get("arch"), "os": info.get("os_pretty")}
             print("--- APPLY ---")
             rc, out, err = run(client, f"bash {REMOTE_PATH} apply {remote_args(args)}", timeout=180)
             sys.stdout.write(out[-3000:])
@@ -234,10 +269,25 @@ def main():
     ap.add_argument("--container", default="dockhand-docker-proxy")
     ap.add_argument("--port", type=int, default=2375)
     ap.add_argument("--bind", default="0.0.0.0")
-    ap.add_argument("--image", default="alpine/socat:latest")
+    ap.add_argument("--image", default=DEFAULT_IMAGE,
+                    help=f"socat image to run (default: {DEFAULT_IMAGE}; "
+                         f"auto-switched to {LOCAL_BUILD_IMAGE} when --build-proxy is set")
+    ap.add_argument("--build-proxy", default="",
+                    help="HTTP proxy URL for local build path (e.g. http://10.0.0.1:7890). "
+                         "When set, the host builds the socat image locally from --build-base "
+                         "instead of running 'docker pull'. Use this for hosts with no internet "
+                         "egress / broken dockerd proxy. dockerd is NOT restarted.")
+    ap.add_argument("--build-base", default="alpine:3.18.2",
+                    help="base image for local build (must already exist on the host)")
     ap.add_argument("--dry-run", action="store_true", help="detect + plan only")
     ap.add_argument("--rollback", action="store_true", help="remove bridge container instead of deploying")
     args = ap.parse_args()
+
+    # When --build-proxy is set and the user did not override --image,
+    # switch to the local-build tag so the produced image matches what apply runs.
+    if args.build_proxy and args.image == DEFAULT_IMAGE:
+        args.image = LOCAL_BUILD_IMAGE
+        print(f"[INFO] --build-proxy set; image auto-switched to {LOCAL_BUILD_IMAGE}")
 
     csv_path = Path(args.csv)
     if not csv_path.exists():

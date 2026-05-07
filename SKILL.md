@@ -29,7 +29,9 @@ python "C:\Users\liujianglong\.qoder\skills\docker-api-bridge\scripts\deploy.py"
 | `--container` | `dockhand-docker-proxy` | 桥接容器名 |
 | `--port` | `2375` | 对外监听端口 |
 | `--bind` | `0.0.0.0` | 监听网卡，可改成 `192.168.123.52` 仅绑内网 |
-| `--image` | `alpine/socat:latest` | 桥接镜像 |
+| `--image` | `alpine/socat:latest` | 桥接镜像；当 `--build-proxy` 设置时自动切换为 `local/socat:latest` |
+| `--build-proxy` | 空 | 触发**本地 build 模式**：远端不走 `docker pull`，而是基于 `--build-base` 在本机构建 socat 镜像，build 阶段通过该 HTTP 代理 `apk add socat`。dockerd 不重启，daemon.json 不动 |
+| `--build-base` | `alpine:3.18.2` | 本地 build 模式的基础镜像，必须已存在于目标主机本地 |
 | `--dry-run` | off | 只 detect + plan，不 apply |
 | `--rollback` | off | 移除桥接容器，恢复原状 |
 
@@ -47,29 +49,72 @@ python "C:\Users\liujianglong\.qoder\skills\docker-api-bridge\scripts\deploy.py"
 
 # 一键回滚
 python "C:\Users\liujianglong\.qoder\skills\docker-api-bridge\scripts\deploy.py" --csv "hosts.csv" --rollback
+
+# 无外网主机：本地 build socat（dockerd 完全不动）
+# 前提：目标主机已有 alpine:3.18.2 等基础镜像，且能访问 --build-proxy
+python "C:\Users\liujianglong\.qoder\skills\docker-api-bridge\scripts\deploy.py" \
+    --csv "hosts.csv" \
+    --build-proxy http://192.168.123.51:7892
 ```
 
 ## 工作流（每台主机）
 
 `deploy.py` 通过 paramiko 连接每台主机，把 `bridge.sh` 上传到 `/tmp/dab_bridge.sh`，依次执行：
 
-1. **detect** → 输出 JSON：`arch / kernel / os / docker_version / sock_exists / image_present / port_listener / port_busy_by_other / existing_container / daemon_proxy`
+1. **detect** → 输出 JSON：`arch / kernel / os / docker_version / sock_exists / image_present / port_listener / port_busy_by_other / existing_container / daemon_proxy / base_image / base_image_present`
 2. **plan** → 本地根据 detect 结果决定动作：
    - 已有同名容器且 `_ping` 通 → SKIP，仅 verify
    - 同名容器异常 → 先 REMOVE
    - 端口被非 docker-proxy 占用 → ABORT
-   - 镜像缺失 → PULL
+   - 镜像缺失 + 未提供 `--build-proxy` → PULL
+   - 镜像缺失 + 提供了 `--build-proxy` → BUILD（前置检查 `base_image_present`，缺失则 ABORT）
    - 否则 RUN
-3. **apply** → `docker run -d --name <C> --restart=always -p <BIND>:<PORT>:2375 -v /var/run/docker.sock:/var/run/docker.sock <IMAGE> -d TCP-LISTEN:<PORT>,fork,reuseaddr UNIX-CONNECT:/var/run/docker.sock`
-4. **verify** → 在远端做 `ss -lntp | grep PORT`、`curl /_ping`、`curl /version`，全部通过才算 OK
+3. **build**（仅本地 build 模式）→ 远端 `/tmp/dab-socat-build/Dockerfile` 写入 `FROM <base> + apk add socat + ENTRYPOINT ["socat"]`，`docker build --build-arg http_proxy=<URL> --build-arg https_proxy=<URL> -t <IMAGE> .`，构建后校验 ENTRYPOINT 必须是 JSON 数组 `[socat]`
+4. **apply** → `docker run -d --name <C> --restart=always -p <BIND>:<PORT>:2375 -v /var/run/docker.sock:/var/run/docker.sock <IMAGE> -d TCP-LISTEN:<PORT>,fork,reuseaddr UNIX-CONNECT:/var/run/docker.sock`
+5. **verify** → 在远端做 `ss -lntp | grep PORT`、`curl /_ping`、`curl /version`，全部通过才算 OK
 
 每台主机执行完打印一段 DETECT/PLAN/APPLY/VERIFY，最后在末尾打印 SUMMARY 表格。
 
 ## 退出码
 
 - `0` 全部主机 OK / DRY_RUN_OK / ROLLBACK_OK
-- `1` 至少一台失败（SSH_FAIL / ABORTED / APPLY_FAIL / VERIFY_FAIL）
+- `1` 至少一台失败（SSH_FAIL / ABORTED / BUILD_FAIL / APPLY_FAIL / VERIFY_FAIL）
 - `2` CSV 解析失败或为空
+
+## 无外网主机的本地 build 旁路（实战）
+
+**适用场景**：目标主机满足任一条件，正常 `docker pull` 路径会失败：
+
+- 主机所在网段无外网出口
+- `dockerd.json` 配过 `http-proxy`，但代理已下线，且**不能重启 dockerd**（如群晖在跑 100+ 容器）
+- registry mirror 也不通
+
+**前置条件**：
+
+1. 目标主机本地至少有一个可作为 base 的小镜像，默认 `alpine:3.18.2`（任何能 `apk add socat` 的 alpine 标签都行；可用 `--build-base` 覆盖）
+2. 目标主机能访问 `--build-proxy` 给的 HTTP 代理（仅 build 阶段需要，~1MB 流量）
+
+**它会做什么**：
+
+- 远端 `/tmp/dab-socat-build/Dockerfile` 写入最小 Dockerfile（heredoc 写入，避开 PowerShell + ssh 双层引号转义）
+- `docker build --build-arg http_proxy=... --build-arg https_proxy=... -t local/socat:latest .`
+- build 完成校验 `docker inspect -f '{{.Config.Entrypoint}}'` 输出必须是 `[socat]` 而不是字面字符串 `["socat"]`
+- 然后正常进入 RUN / VERIFY
+
+**它不会做什么**：
+
+- **不重启 dockerd**
+- **不修改 daemon.json**
+- **不影响主机现有容器**（DSM 6.2 上 113 容器跑着原地零中断验证通过）
+
+**典型命令**：
+
+```bash
+python deploy.py --csv password_21.csv \
+    --build-proxy http://192.168.123.51:7892
+```
+
+**回滚**：和默认路径一样 `--rollback` 即可；本地 build 出来的 `local/socat:latest` 镜像默认保留（手动清理：`docker rmi local/socat:latest`）。
 
 ## 安全说明
 

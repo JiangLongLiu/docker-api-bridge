@@ -219,10 +219,12 @@ docker-api-bridge/
 
 本项目采用 [MIT 许可证](LICENSE)。
 
-## 支持
+## 反馈
 
-- 🐛 [报告问题](https://github.com/JiangLongLiu/docker-api-bridge/issues)
-- 💡 [功能请求](https://github.com/JiangLongLiu/docker-api-bridge/issues)
+本仓库**未启用 Issues**。如需报告 Bug 或提出新需求：
+
+- 📧 通过 [JiangLongLiu 的 GitHub 主页](https://github.com/JiangLongLiu) 联系
+- 🍴 Fork 本仓库后提交 Pull Request
 
 ## ⭐ 支持作者
 

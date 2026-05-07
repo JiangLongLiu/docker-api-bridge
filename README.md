@@ -219,10 +219,12 @@ Something else (likely `dockerd -H tcp://...` from a previous manual fix) is hol
 
 This project is licensed under the [MIT License](LICENSE).
 
-## Support
+## Feedback
 
-- 🐛 [Report Issues](https://github.com/JiangLongLiu/docker-api-bridge/issues)
-- 💡 [Feature Requests](https://github.com/JiangLongLiu/docker-api-bridge/issues)
+Issues are intentionally **disabled** on this repository. For bug reports or feature requests:
+
+- 📧 Reach out via [JiangLongLiu's GitHub profile](https://github.com/JiangLongLiu)
+- 🍴 Fork the repo and send a Pull Request
 
 ## ⭐ Show Your Support
 

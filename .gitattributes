@@ -1,0 +1,3 @@
+# Force LF for shell scripts so they run correctly on remote Linux hosts
+*.sh text eol=lf
+*.py text eol=lf

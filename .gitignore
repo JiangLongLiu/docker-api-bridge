@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local test fixtures (CSV with real credentials)
+password*.csv
+hosts*.csv
+*.local.csv
+
+# Logs / tmp
+*.log
+*.tmp
+*.temp
